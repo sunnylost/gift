@@ -1,7 +1,7 @@
 (function(root, mod) {
     if (typeof exports == "object" && typeof module == "object") return mod(exports); // CommonJS
     if (typeof define == "function" && define.amd) return define(["exports"], mod); // AMD
-    mod(root.gift || (root.gift = {})); // Plain browser env
+    root.Gift = mod(); // Plain browser env
 })(this, function(exports) {
     "use strict";
 
@@ -65,6 +65,7 @@
      */
     function GIFDecoder(data) {
         this.stream = new DataStream(data);
+        this.frames = [];
     }
 
     GIFDecoder.prototype = {
@@ -76,7 +77,8 @@
         },
 
         parseHeader: function() {
-            var head      = this.stream.readString(6),
+            var stream    = this.stream,
+                head      = stream.readString(6),
                 signature = head.substring(0, 3),
                 version   = head.substring(3);
 
@@ -84,12 +86,14 @@
             console.log('Version   = ', version);
 
             this.parseLogicalScreenDescriptor();
+
+            this.gifHeader = stream.data.subarray(0, stream.index);
         },
 
         parseLogicalScreenDescriptor: function() {
             var stream = this.stream;
-            console.log('width  = ', stream.readUnsigned(), 'px');
-            console.log('height = ', stream.readUnsigned(), 'px');
+            console.log('width  = ', this.width  = stream.readUnsigned(), 'px');
+            console.log('height = ', this.height = stream.readUnsigned(), 'px');
 
             /**
              * <Packed Fields>  =      Global Color Table Flag       1 Bit
@@ -126,10 +130,11 @@
             console.log(raw = stream.readString(size));
 
             for(len = raw.length; i < len - 2; i += 3) {
-                colors.push(toHex(raw[i]) + toHex(raw[i + 1]) + toHex(raw[i + 2]));
+                colors.push(raw[i], raw[i + 1], raw[i + 2]);
+                //colors.push(toHex(raw[i]) + toHex(raw[i + 1]) + toHex(raw[i + 2]));
             }
 
-            console.log(colors);
+            this.globalColorTable = colors;
         },
 
         parseBlock: function() {
@@ -170,6 +175,7 @@
                 this.parseApplicationExtension();
             } else if(label == LABEL_COMMENT) {
                 console.log('Extension Type = Comment');
+                this.parseCommentExtension();
             } else if(label == LABEL_GRAPHIC_CONTROL) {
                 console.log('Extension Type = Graphic control');
                 this.parseGraphicControlExtension();
@@ -205,7 +211,19 @@
             bytes = stream.readString(size);
             console.log(bytes);
             if(stream.readByte() != BLOCK_TERMINATOR) {
-                throw Error('Block is not terminated correctly!')
+                throw Error('Block is not terminated correctly!');
+            }
+        },
+
+        parseCommentExtension: function() {
+            var stream = this.stream,
+                size   = stream.readByte(), datas;
+
+            datas = stream.readString(size);
+            console.log('Comment content ', datas)
+
+            if(stream.readByte() != BLOCK_TERMINATOR) {
+                throw Error('Comment Extension Block is not terminated correctly!');
             }
         },
 
@@ -235,7 +253,7 @@
             console.log('User Input Flag = ', fields.shift());
             console.log('Transparent Color Flag = ', fields[0]);
 
-            console.log('Delay Time = ', stream.readUnsigned());
+            console.log('Delay Time = ', this.delay = stream.readUnsigned());
             console.log('Transparent Color Index = ', stream.readByte());
 
             if(stream.readByte() != BLOCK_TERMINATOR) {
@@ -265,12 +283,14 @@
 
          */
         parseImageBlock: function() {
-            var stream = this.stream;
+            var stream = this.stream,
+                index  = stream.index,
+                lzwConfig = {};
 
-            console.log('Image Left Position = ', stream.readUnsigned());
-            console.log('Image Top  Position = ', stream.readUnsigned());
-            console.log('Image Width         = ', stream.readUnsigned());
-            console.log('Image Height        = ', stream.readUnsigned());
+            console.log('Image Left Position = ', lzwConfig.leftPos = stream.readUnsigned());
+            console.log('Image Top  Position = ', lzwConfig.topPos  = stream.readUnsigned());
+            console.log('Image Width         = ', lzwConfig.width   = stream.readUnsigned());
+            console.log('Image Height        = ', lzwConfig.height  = stream.readUnsigned());
 
             var fields = stream.readBinary(),
                 hasLocalColorTable,
@@ -286,23 +306,103 @@
                 //TODO
             }
 
-            var LZWMinimumCodeSize = stream.readByte();
-            console.log('LZW Minimum Code Size = ', LZWMinimumCodeSize);
+            lzwConfig.codeSize = stream.readByte();
+            console.log('LZW Minimum Code Size = ', lzwConfig.codeSize);
 
-            var next, imgData;
+            var next, imgData = [];
             while((next = stream.readByte()) != BLOCK_TERMINATOR) {
-                imgData = stream.readBytes(next);
-                //console.log(imgData);
+                imgData.push(next);
+                imgData = imgData.concat(stream.readBytes(next));
             }
+
+            this.frames.push({
+                data: stream.data.subarray(index - 1, stream.index)
+            });
 
             this.parseBlock();
         },
 
         parseDone: function() {
+            this.gifFooter = this.stream.data.subarray(-1);
+            console.log(this.gifFooter);
             //TODO
             console.log('Parse Done!')
         }
     };
+
+    /**
+     * https://github.com/shachaf/jsgif/blob/master/gif.js#L52
+     */
+    function parseLZW(config) {
+        var globalColorTable = config.globalColorTable,
+            minCodeSize      = config.codeSize,
+            data = config.data;
+
+        var pos = 0; // Maybe this streaming thing should be merged with the Stream?
+
+        var readCode = function(size) {
+            var code = 0;
+            for (var i = 0; i < size; i++) {
+                if (data[pos >> 3] & (1 << (pos & 7))) {
+                    code |= 1 << i;
+                }
+                pos++;
+            }
+            return code;
+        };
+
+        var output = [];
+
+        var clearCode = 1 << minCodeSize;
+        var eoiCode = clearCode + 1;
+
+        var codeSize = minCodeSize + 1;
+
+        var dict = [];
+
+        var clear = function() {
+            dict = [];
+            codeSize = minCodeSize + 1;
+            for (var i = 0; i < clearCode; i++) {
+                dict[i] = [i];
+            }
+            dict[clearCode] = [];
+            dict[eoiCode] = null;
+
+        };
+
+        var code;
+        var last;
+
+        while (true) {
+            last = code;
+            code = readCode(codeSize);
+
+            if (code === clearCode) {
+                clear();
+                continue;
+            }
+            if (code === eoiCode) break;
+
+            if (code < dict.length) {
+                if (last !== clearCode) {
+                    dict.push(dict[last].concat(dict[code][0]));
+                }
+            } else {
+                if (code !== dict.length) throw new Error('Invalid LZW code.');
+                dict.push(dict[last].concat(dict[last][0]));
+            }
+            output.push.apply(output, globalColorTable[dict[code]].map(function(v) {
+                return globalColorTable[v];
+            }));
+
+            if (dict.length === (1 << codeSize) && codeSize < 12) {
+                codeSize++;
+            }
+        }
+
+        return output;
+    }
 
     function toHex(str) {
         str = (str.charCodeAt(0) & 0xff).toString(16);
@@ -316,7 +416,9 @@
      * Application Extension Label 0xff
      */
 
-    exports.Gift = function(data) {
+    window.GLOBAL_COLORS = {length: 0};
+
+    return function(data) {
         return new GIFDecoder(data);
     };
 })
